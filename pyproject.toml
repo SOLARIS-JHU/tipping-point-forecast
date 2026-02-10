@@ -1,0 +1,17 @@
+[project]
+name = "tipping-point-forecast"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "neuraloperator",
+    "scipy>=1.17.0",
+    "torch>=2.10.0",
+    "tqdm>=4.67.3",
+]
+
+[tool.uv.sources]
+neuraloperator = { path = "../../neuraloperator", editable = true }
