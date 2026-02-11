@@ -1,6 +1,6 @@
 """
-    This script applies the 2D RNO model to predict nonstationary KS in an
-    autoregressive manner, where each step outputs an interval of the solution.
+This script applies the 2D RNO model to predict nonstationary KS in an
+autoregressive manner, where each step outputs an interval of the solution.
 """
 
 import torch
@@ -20,18 +20,22 @@ from tqdm import tqdm
 torch.manual_seed(0)
 np.random.seed(0)
 
-def round_down(num, divisor): # rounds `num` down to nearest multiple of `divisor`
+
+def round_down(num, divisor):  # rounds `num` down to nearest multiple of `divisor`
     return num - (num % divisor)
 
-if __name__ == '__main__':
-    ntrain = 160
-    ntest = 40
+
+if __name__ == "__main__":
+    ntrain = 16  # 160
+    ntest = 4  # 40
 
     save_loss_history = True
     save_weights = False
 
     train_up_to_tipping_point = True
-    tipping_data_split_prop = 0.67 # proportion of trajectory at which to split the data for pre/post tipping
+    tipping_data_split_prop = (
+        0.67  # proportion of trajectory at which to split the data for pre/post tipping
+    )
 
     modes1 = 20
     modes2 = 20
@@ -48,7 +52,7 @@ if __name__ == '__main__':
     multi_step_fine_tuning = True
     fine_tuning_num_steps = 5
     fine_tune_ep = 25
-    fine_tuning_lr = 1e-3 # NOTE: change if necessary
+    fine_tuning_lr = 1e-3  # NOTE: change if necessary
     fine_tune_scheduler_step = 2000
     fine_tune_scheduler_gamma = 0.5
 
@@ -58,11 +62,11 @@ if __name__ == '__main__':
     print("Scheduler gamma:", scheduler_gamma)
     print()
 
-    path = 'MODEL/SAVE/PATH'
-    path_model = 'model/'+path
+    path = "RNO_KS_ntrain_" + str(ntrain) + "_ntest_" + str(ntest)
+    path_model = "model/" + path
 
-    sub = 4 # spatial subsample
-    T = 16 # input last T time steps and output next T
+    sub = 4  # spatial subsample
+    T = 16  # input last T time steps and output next T
     n_intervals = 5
 
     ################################################################
@@ -70,7 +74,7 @@ if __name__ == '__main__':
     ################################################################
 
     t1 = default_timer()
-    data = np.load('PATH/TO/DATA.npy')[:, ::sub]
+    data = np.load("tipping_KS_data_20_traj_dt_0.001.npy")[:, ::sub]
     data = torch.tensor(data)
 
     n_time = data.shape[2]
@@ -81,15 +85,15 @@ if __name__ == '__main__':
 
     if train_up_to_tipping_point:
         tipping_idx = round_down(int(tipping_data_split_prop * n_time), T)
-        train = train[:,:,:tipping_idx]
-        test = test[:,:,:tipping_idx]
+        train = train[:, :, :tipping_idx]
+        test = test[:, :, :tipping_idx]
     else:
         idx = round_down(n_time, T)
-        train = train[:,:,:idx]
-        test = test[:,:,:idx]
+        train = train[:, :, :idx]
+        test = test[:, :, :idx]
 
-    train = torch.stack(torch.split(train, T, dim=-1)).permute(1,0,3,2).unsqueeze(-1)
-    test = torch.stack(torch.split(test, T, dim=-1)).permute(1,0,3,2).unsqueeze(-1)
+    train = torch.stack(torch.split(train, T, dim=-1)).permute(1, 0, 3, 2).unsqueeze(-1)
+    test = torch.stack(torch.split(test, T, dim=-1)).permute(1, 0, 3, 2).unsqueeze(-1)
 
     # Generate training pairs
     x_train = []
@@ -98,15 +102,17 @@ if __name__ == '__main__':
     y_test = []
 
     for traj in train:
-        for i in range(train.shape[1] - n_intervals - 1): # - 1 to make sure the y value exists
-            x_train.append(traj[i:i + n_intervals])
+        for i in range(
+            train.shape[1] - n_intervals - 1
+        ):  # - 1 to make sure the y value exists
+            x_train.append(traj[i : i + n_intervals])
             y_train.append(traj[i + n_intervals])
 
     for traj in test:
         for i in range(test.shape[1] - n_intervals - 1):
-            x_test.append(traj[i:i + n_intervals])
+            x_test.append(traj[i : i + n_intervals])
             y_test.append(traj[i + n_intervals])
-    
+
     x_train = torch.stack(x_train, dim=0).float()
     y_train = torch.stack(y_train, dim=0).float()
     x_test = torch.stack(x_test, dim=0).float()
@@ -123,7 +129,7 @@ if __name__ == '__main__':
             n_ylist = []
             for traj in train:
                 for i in range(train.shape[1] - n_intervals - n):
-                    n_xlist.append(traj[i:i + n_intervals])
+                    n_xlist.append(traj[i : i + n_intervals])
                     n_ylist.append(traj[i + n_intervals + n - 1])
             multi_step_x_train_list.append(torch.stack(n_xlist, dim=0).float())
             multi_step_y_train_list.append(torch.stack(n_ylist, dim=0).float())
@@ -133,7 +139,7 @@ if __name__ == '__main__':
             n_ylist = []
             for traj in test:
                 for i in range(test.shape[1] - n_intervals - n):
-                    n_xlist.append(traj[i:i + n_intervals])
+                    n_xlist.append(traj[i : i + n_intervals])
                     n_ylist.append(traj[i + n_intervals + n - 1])
             multi_step_x_test_list.append(torch.stack(n_xlist, dim=0).float())
             multi_step_y_test_list.append(torch.stack(n_ylist, dim=0).float())
@@ -143,12 +149,38 @@ if __name__ == '__main__':
         multi_step_x_test_list.insert(0, x_test)
         multi_step_y_test_list.insert(0, y_test)
 
-    train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_train, y_train), batch_size=batch_size, shuffle=True, drop_last=True)
-    test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test, y_test), batch_size=batch_size, shuffle=False, drop_last=True)
+    train_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(x_train, y_train),
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(x_test, y_test),
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=True,
+    )
 
     if multi_step_fine_tuning:
-        multi_step_train_loaders = [torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x, y), batch_size=batch_size, shuffle=True, drop_last=True) for x,y in zip(multi_step_x_train_list, multi_step_y_train_list)]
-        multi_step_test_loaders = [torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x, y), batch_size=batch_size, shuffle=False, drop_last=True) for x,y in zip(multi_step_x_test_list, multi_step_y_test_list)]
+        multi_step_train_loaders = [
+            torch.utils.data.DataLoader(
+                torch.utils.data.TensorDataset(x, y),
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=True,
+            )
+            for x, y in zip(multi_step_x_train_list, multi_step_y_train_list)
+        ]
+        multi_step_test_loaders = [
+            torch.utils.data.DataLoader(
+                torch.utils.data.TensorDataset(x, y),
+                batch_size=batch_size,
+                shuffle=False,
+                drop_last=True,
+            )
+            for x, y in zip(multi_step_x_test_list, multi_step_y_test_list)
+        ]
 
         multi_step_list = []
         for i in range(len(multi_step_train_loaders)):
@@ -160,29 +192,32 @@ if __name__ == '__main__':
     print("y_train shape:", y_train.shape)
     print("x_test shape:", x_test.shape)
     print("y_test shape:", y_test.shape)
-    device = torch.device('cuda')
+    device = torch.device("cuda")
     print()
-
 
     ################################################################
     # model and optimizer
     ################################################################
 
     from neuralop.models import RNO
-    
+
     model = RNO(
         n_modes=(modes1, modes2),
         hidden_channels=width,
-        in_channels=dim, 
+        in_channels=dim,
         out_channels=dim,
         n_layers=3,
-        domain_padding=[0.1, 0]
+        domain_padding=[0.1, 0],
     ).cuda()
-    
+
     print("Model parameters:", count_params(model))
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=learning_rate, weight_decay=1e-4
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=scheduler_step, gamma=scheduler_gamma
+    )
 
     lploss = LpLoss(size_average=False)
 
@@ -190,14 +225,14 @@ if __name__ == '__main__':
     # training and evaluation
     ################################################################
 
-    num_train_samples = x_train.shape[0] 
+    num_train_samples = x_train.shape[0]
     num_test_samples = x_test.shape[0]
 
     if multi_step_fine_tuning:
         ntrain_list = [arr.shape[0] for arr in multi_step_x_train_list]
         ntest_list = [arr.shape[0] for arr in multi_step_x_test_list]
 
-    ### Training 
+    ### Training
     training_loss_history = []
     print("Begin training:")
     for ep in range(1, epochs + 1):
@@ -210,7 +245,7 @@ if __name__ == '__main__':
 
             # Permute for RNO
             x_in = x.permute(0, 1, 4, 2, 3)
-            out = model.predict(x_in, num_steps=1)[:,-1]
+            out = model.predict(x_in, num_steps=1)[:, -1]
             # Permute back
             out = out.permute(0, 2, 3, 1)
             loss = lploss(out, y)
@@ -229,7 +264,7 @@ if __name__ == '__main__':
                 y = y.to(device).view(batch_size, T, n_x, dim)
 
                 x_in = x.permute(0, 1, 4, 2, 3)
-                out = model.predict(x_in, num_steps=1)[:,-1]
+                out = model.predict(x_in, num_steps=1)[:, -1]
                 out = out.permute(0, 2, 3, 1)
                 test_l2 += lploss(out, y).item()
 
@@ -237,23 +272,40 @@ if __name__ == '__main__':
         test_l2 /= num_test_samples
         training_loss_history.append(test_l2)
 
-        print("Epoch:", ep, "Time:", default_timer() - t1, "Train L2:", train_l2, "Test L2:", test_l2)
+        print(
+            "Epoch:",
+            ep,
+            "Time:",
+            default_timer() - t1,
+            "Train L2:",
+            train_l2,
+            "Test L2:",
+            test_l2,
+        )
 
     ### Multi-step fine-tuning
     if multi_step_fine_tuning:
-        fine_tuning_loss_histories = {i : [] for i in range(1, fine_tuning_num_steps + 1)}
+        fine_tuning_loss_histories = {
+            i: [] for i in range(1, fine_tuning_num_steps + 1)
+        }
         print("Begin multi-step fine-tuning:")
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=fine_tuning_lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=fine_tune_scheduler_step, gamma=fine_tune_scheduler_gamma)
-        
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=fine_tuning_lr, weight_decay=1e-4
+        )
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=fine_tune_scheduler_step,
+            gamma=fine_tune_scheduler_gamma,
+        )
+
         for ep in range(fine_tune_ep):
             random.shuffle(multi_step_list)
             iters = [iter(loader) for loader in multi_step_train_loaders]
 
             model.train()
             t1 = default_timer()
-            
+
             train_l2_list = [0.0 for i in range(len(multi_step_train_loaders))]
 
             for n in tqdm(multi_step_list):
@@ -264,12 +316,15 @@ if __name__ == '__main__':
 
                 optimizer.zero_grad()
                 x_in = x.permute(0, 1, 4, 2, 3)
-                out = model.predict(x_in, num_steps=num_steps)[:,-1]
+                out = model.predict(x_in, num_steps=num_steps)[:, -1]
                 out = out.permute(0, 2, 3, 1)
 
-                l2 = lploss(torch.reshape(out, (-1, n_x * T * dim)), torch.reshape(y, (-1, n_x * T * dim)))
+                l2 = lploss(
+                    torch.reshape(out, (-1, n_x * T * dim)),
+                    torch.reshape(y, (-1, n_x * T * dim)),
+                )
                 optimizer.zero_grad()
-                l2.backward() # use the l2 relative loss
+                l2.backward()  # use the l2 relative loss
 
                 optimizer.step()
                 scheduler.step()
@@ -285,10 +340,13 @@ if __name__ == '__main__':
                         y = y.to(device).view(batch_size, T, n_x, dim)
 
                         x_in = x.permute(0, 1, 4, 2, 3)
-                        out = model.predict(x_in, num_steps=num_steps)[:,-1]
+                        out = model.predict(x_in, num_steps=num_steps)[:, -1]
                         out = out.permute(0, 2, 3, 1)
 
-                        test_l2_list[n] += lploss(torch.reshape(out, (-1, n_x * T * dim)), torch.reshape(y, (-1, n_x * T * dim))).item()
+                        test_l2_list[n] += lploss(
+                            torch.reshape(out, (-1, n_x * T * dim)),
+                            torch.reshape(y, (-1, n_x * T * dim)),
+                        ).item()
 
             for n in range(len(multi_step_train_loaders)):
                 num_steps = n + 1
@@ -298,18 +356,26 @@ if __name__ == '__main__':
                 (fine_tuning_loss_histories[num_steps]).append(test_l2_list[n])
 
             t2 = default_timer()
-            print("Fine-tune epoch:", ep + 1, "Time:", t2-t1, "Train L2:", train_l2_list, "Test L2:", test_l2_list)
+            print(
+                "Fine-tune epoch:",
+                ep + 1,
+                "Time:",
+                t2 - t1,
+                "Train L2:",
+                train_l2_list,
+                "Test L2:",
+                test_l2_list,
+            )
 
     if save_loss_history:
         if epochs > 0:
-            with open(path + '_one_step_loss_history.p', 'wb') as file:
+            with open(path + "_one_step_loss_history.p", "wb") as file:
                 pickle.dump(training_loss_history, file)
             print("One step test loss history saved to", file.name)
         if fine_tune_ep > 0 and multi_step_fine_tuning:
-            with open(path + '_multi_step_loss_history.p', 'wb') as file:
+            with open(path + "_multi_step_loss_history.p", "wb") as file:
                 pickle.dump(fine_tuning_loss_histories, file)
             print("Multi-step test loss histories saved to", file.name)
-        
 
     if save_weights:
         torch.save(model, path_model)
