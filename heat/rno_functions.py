@@ -3,6 +3,7 @@
 This module centralizes shared components used by:
 - ``train_RNO_broadcast.ipynb``
 - ``train_RNO_sin_embed.ipynb``
+- ``train_RNO_gaussian_actuators.ipynb``
 
 Classes
 -------
@@ -14,6 +15,9 @@ RNOControlARBroadcast
 RNOControlARSinEmbed
     Autoregressive wrapper where controls are lifted with ``ControlLifterSin`` and
     concatenated as a second channel.
+RNOControlARGaussianActuators
+    Autoregressive wrapper where controls are lifted into spatial forcing fields
+    using Gaussian actuator footprints, then concatenated with state.
 """
 
 from __future__ import annotations
@@ -377,6 +381,187 @@ class RNOControlARSinEmbed(nn.Module):
                 current_state = teacher_forcing_states[:, k]
 
             ctrl_t = ctrl_seq[:, k]
+            u_next, hidden_states = self.forward_one(
+                current_state,
+                ctrl_t,
+                hidden_states=hidden_states,
+                return_hidden_states=True,
+            )
+            traj.append(u_next)
+            current_state = u_next
+
+        return torch.stack(traj, dim=1)
+
+
+class RNOControlARGaussianActuators(nn.Module):
+    """Autoregressive RNO wrapper using Gaussian actuator control lifting.
+
+    Controls are interpreted as actuator amplitudes and lifted to a forcing field:
+
+    ``f(x, t) = sum_j u_j(t) * exp(- (x - mu_j)^2 / (2*sigma^2))``
+
+    The lifted forcing channel is concatenated with state, giving RNO inputs of shape
+    ``(B, T_hist, 2, T_inner, nx)``.
+    """
+
+    def __init__(
+        self,
+        rno: nn.Module,
+        mus=(0.2, 0.4, 0.6, 0.8),
+        sigma: float = 0.1,
+        x_min: float = 0.0,
+        x_max: float = 1.0,
+        normalize: bool = True,
+    ):
+        super().__init__()
+        self.rno = rno
+        self.mus = tuple(float(m) for m in mus)
+        self.sigma = float(sigma)
+        self.x_min = float(x_min)
+        self.x_max = float(x_max)
+        self.normalize = bool(normalize)
+        self._A_cache = {}
+
+    def _cache_key(self, device, dtype, nx: int, nf: int):
+        return (
+            device.type,
+            device.index,
+            str(dtype),
+            int(nx),
+            int(nf),
+            self.mus,
+            self.sigma,
+            self.x_min,
+            self.x_max,
+            self.normalize,
+        )
+
+    def _get_cached_A(self, device, dtype, nx: int, nf: int) -> torch.Tensor:
+        key = self._cache_key(device=device, dtype=dtype, nx=nx, nf=nf)
+        if key not in self._A_cache:
+            x = torch.linspace(
+                self.x_min, self.x_max, nx, device=device, dtype=dtype
+            ).view(nx, 1)  # (nx, 1)
+            mu = torch.tensor(self.mus, device=device, dtype=dtype).view(1, nf)  # (1, nf)
+            A = torch.exp(-0.5 * ((x - mu) / self.sigma) ** 2)  # (nx, nf)
+            if self.normalize:
+                A = A / (A.sum(dim=0, keepdim=True) + 1e-12)
+            self._A_cache[key] = A
+        return self._A_cache[key]
+
+    def build_rno_input(self, x_state: torch.Tensor, x_ctrl: torch.Tensor) -> torch.Tensor:
+        """Build RNO input for Gaussian actuator strategy.
+
+        ``x_state``: ``(B, T_hist, 1, T_inner, nx)``
+        ``x_ctrl``: ``(B, T_hist, 1, T_inner, nf)``
+        Returns: ``(B, T_hist, 2, T_inner, nx)``
+        """
+        if x_state.ndim != 5 or x_ctrl.ndim != 5:
+            raise ValueError(
+                f"Expected rank-5 tensors, got x_state={tuple(x_state.shape)}, x_ctrl={tuple(x_ctrl.shape)}"
+            )
+        if x_state.shape[:2] != x_ctrl.shape[:2] or x_state.shape[3] != x_ctrl.shape[3]:
+            raise ValueError(
+                "State/control batch/time/inner-time dims must match: "
+                f"x_state={tuple(x_state.shape)}, x_ctrl={tuple(x_ctrl.shape)}"
+            )
+        if x_ctrl.shape[2] != 1:
+            raise ValueError(f"Expected x_ctrl channel dim=1, got {x_ctrl.shape[2]}")
+
+        controls_lastdim = x_ctrl.squeeze(2)  # (B, T_hist, T_inner, nf)
+        nf = controls_lastdim.shape[-1]
+        if nf != len(self.mus):
+            raise ValueError(
+                f"Expected control dim nf={len(self.mus)} from mus, got nf={nf}"
+            )
+
+        nx = x_state.shape[-1]
+        A = self._get_cached_A(
+            device=x_state.device, dtype=x_state.dtype, nx=nx, nf=nf
+        )  # (nx, nf)
+        forcing = torch.einsum("...f,xf->...x", controls_lastdim, A)  # (B, T_hist, T_inner, nx)
+        forcing = forcing.unsqueeze(2)  # (B, T_hist, 1, T_inner, nx)
+
+        return torch.cat([x_state, forcing], dim=2)  # (B, T_hist, 2, T_inner, nx)
+
+    def forward_one(
+        self,
+        u_t: torch.Tensor,
+        ctrl_t: torch.Tensor,
+        hidden_states=None,
+        return_hidden_states: bool = False,
+    ):
+        """Predict one step ``u_{t+1}`` from ``u_t`` and exogenous ``ctrl_t``."""
+        if u_t.ndim == 4:
+            u_t = u_t.unsqueeze(1)  # (B, 1, 1, T_inner, nx)
+        if ctrl_t.ndim == 4:
+            ctrl_t = ctrl_t.unsqueeze(1)  # (B, 1, 1, T_inner, nf)
+
+        if u_t.ndim != 5 or u_t.shape[1] != 1:
+            raise ValueError(f"u_t must be (B,1,1,T_inner,nx), got {tuple(u_t.shape)}")
+        if ctrl_t.ndim != 5 or ctrl_t.shape[1] != 1:
+            raise ValueError(
+                f"ctrl_t must be (B,1,1,T_inner,nf), got {tuple(ctrl_t.shape)}"
+            )
+
+        x_in = self.build_rno_input(u_t, ctrl_t)
+        u_next, hidden_states = self.rno(
+            x_in,
+            init_hidden_states=hidden_states,
+            return_hidden_states=True,
+            keep_states_padded=True,
+        )
+
+        if return_hidden_states:
+            return u_next, hidden_states
+        return u_next
+
+    def rollout(
+        self,
+        u0: torch.Tensor,
+        ctrl_seq: torch.Tensor,
+        steps: int,
+        teacher_forcing_states: torch.Tensor | None = None,
+        use_teacher_forcing: bool = False,
+    ) -> torch.Tensor:
+        """Roll out trajectory with exogenous controls aligned as ``ctrl_seq[:, k]``."""
+        if u0.ndim == 5:
+            if u0.shape[1] != 1:
+                raise ValueError(
+                    f"u0 with rank-5 must have time dim=1, got {tuple(u0.shape)}"
+                )
+            current_state = u0[:, 0]
+        elif u0.ndim == 4:
+            current_state = u0
+        else:
+            raise ValueError(f"u0 must be rank 4 or 5, got {tuple(u0.shape)}")
+
+        if ctrl_seq.ndim != 5:
+            raise ValueError(f"ctrl_seq must be rank-5, got {tuple(ctrl_seq.shape)}")
+        if ctrl_seq.shape[1] < steps:
+            raise ValueError(
+                f"ctrl_seq has {ctrl_seq.shape[1]} steps but rollout requested {steps}"
+            )
+
+        if use_teacher_forcing:
+            if teacher_forcing_states is None:
+                raise ValueError(
+                    "use_teacher_forcing=True requires teacher_forcing_states"
+                )
+            if teacher_forcing_states.shape[1] < steps:
+                raise ValueError(
+                    "teacher_forcing_states must have at least 'steps' timesteps "
+                    f"(got {teacher_forcing_states.shape[1]} < {steps})"
+                )
+
+        traj = [current_state]
+        hidden_states = None
+
+        for k in range(steps):
+            if use_teacher_forcing and k > 0:
+                current_state = teacher_forcing_states[:, k]
+
+            ctrl_t = ctrl_seq[:, k]  # controls are exogenous and aligned with u_k
             u_next, hidden_states = self.forward_one(
                 current_state,
                 ctrl_t,
