@@ -10,3 +10,4 @@ venv/
 model/
 logs/
 */result*/*
+*/wandb/*
