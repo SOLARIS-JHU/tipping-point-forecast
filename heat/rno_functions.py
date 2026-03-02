@@ -442,14 +442,18 @@ class RNOControlARGaussianActuators(nn.Module):
             x = torch.linspace(
                 self.x_min, self.x_max, nx, device=device, dtype=dtype
             ).view(nx, 1)  # (nx, 1)
-            mu = torch.tensor(self.mus, device=device, dtype=dtype).view(1, nf)  # (1, nf)
+            mu = torch.tensor(self.mus, device=device, dtype=dtype).view(
+                1, nf
+            )  # (1, nf)
             A = torch.exp(-0.5 * ((x - mu) / self.sigma) ** 2)  # (nx, nf)
             if self.normalize:
                 A = A / (A.sum(dim=0, keepdim=True) + 1e-12)
             self._A_cache[key] = A
         return self._A_cache[key]
 
-    def build_rno_input(self, x_state: torch.Tensor, x_ctrl: torch.Tensor) -> torch.Tensor:
+    def build_rno_input(
+        self, x_state: torch.Tensor, x_ctrl: torch.Tensor
+    ) -> torch.Tensor:
         """Build RNO input for Gaussian actuator strategy.
 
         ``x_state``: ``(B, T_hist, 1, T_inner, nx)``
@@ -479,7 +483,9 @@ class RNOControlARGaussianActuators(nn.Module):
         A = self._get_cached_A(
             device=x_state.device, dtype=x_state.dtype, nx=nx, nf=nf
         )  # (nx, nf)
-        forcing = torch.einsum("...f,xf->...x", controls_lastdim, A)  # (B, T_hist, T_inner, nx)
+        forcing = torch.einsum(
+            "...f,xf->...x", controls_lastdim, A
+        )  # (B, T_hist, T_inner, nx)
         forcing = forcing.unsqueeze(2)  # (B, T_hist, 1, T_inner, nx)
 
         return torch.cat([x_state, forcing], dim=2)  # (B, T_hist, 2, T_inner, nx)
@@ -572,3 +578,308 @@ class RNOControlARGaussianActuators(nn.Module):
             current_state = u_next
 
         return torch.stack(traj, dim=1)
+
+
+def rollout_variant_a_carry(
+    ar_model_obj,
+    u0: torch.Tensor,
+    ctrl_seq: torch.Tensor,
+    steps: int,
+):
+    """Variant A rollout: carry hidden state across all rollout steps.
+
+    Parameters
+    ----------
+    ar_model_obj:
+        Any wrapper exposing ``forward_one(u_t, ctrl_t, hidden_states, return_hidden_states)``.
+    u0:
+        ``(B, 1, T_inner, nx)`` initial state.
+    ctrl_seq:
+        ``(B, steps, 1, T_inner, n_ctrl)`` exogenous controls aligned with ``u_k``.
+    steps:
+        Number of autoregressive rollout steps.
+
+    Returns
+    -------
+    tuple[torch.Tensor, Any]
+        ``(traj, hidden_states_final)`` where ``traj`` has shape
+        ``(B, steps+1, 1, T_inner, nx)``.
+    """
+    if ctrl_seq.ndim != 5:
+        raise ValueError(f"ctrl_seq must be rank-5, got {tuple(ctrl_seq.shape)}")
+    if ctrl_seq.shape[1] < steps:
+        raise ValueError(
+            f"ctrl_seq has {ctrl_seq.shape[1]} steps but rollout requested {steps}"
+        )
+
+    current_state = u0
+    traj = [current_state]
+    hidden_states = None
+
+    for k in range(steps):
+        ctrl_t = ctrl_seq[:, k]  # (B, 1, T_inner, n_ctrl)
+        u_next, hidden_states = ar_model_obj.forward_one(
+            current_state,
+            ctrl_t,
+            hidden_states=hidden_states,
+            return_hidden_states=True,
+        )
+        traj.append(u_next)
+        current_state = u_next
+
+    return torch.stack(traj, dim=1), hidden_states
+
+
+def rollout_variant_b_reset_each_step(
+    ar_model_obj,
+    u0: torch.Tensor,
+    ctrl_seq: torch.Tensor,
+    steps: int,
+):
+    """Variant B rollout: reset hidden state to ``None`` at each step."""
+    if ctrl_seq.ndim != 5:
+        raise ValueError(f"ctrl_seq must be rank-5, got {tuple(ctrl_seq.shape)}")
+    if ctrl_seq.shape[1] < steps:
+        raise ValueError(
+            f"ctrl_seq has {ctrl_seq.shape[1]} steps but rollout requested {steps}"
+        )
+
+    current_state = u0
+    traj = [current_state]
+
+    for k in range(steps):
+        ctrl_t = ctrl_seq[:, k]  # (B, 1, T_inner, n_ctrl)
+        u_next = ar_model_obj.forward_one(
+            current_state,
+            ctrl_t,
+            hidden_states=None,
+            return_hidden_states=False,
+        )
+        traj.append(u_next)
+        current_state = u_next
+
+    return torch.stack(traj, dim=1)
+
+
+def rollout_variant_c_warmup_then_carry(
+    ar_model_obj,
+    x_state_hist: torch.Tensor,
+    x_ctrl_hist: torch.Tensor,
+    u0: torch.Tensor,
+    ctrl_seq: torch.Tensor,
+    steps: int,
+    history: int | None = None,
+    warmup_steps: int | None = None,
+):
+    """Variant C rollout: warm-up on history, then carry hidden state.
+
+    Warm-up uses teacher forcing over history windows and excludes ``u0`` by default.
+    """
+    if x_state_hist.ndim != 5:
+        raise ValueError(
+            f"x_state_hist must be rank-5, got {tuple(x_state_hist.shape)}"
+        )
+    if x_ctrl_hist.ndim != 5:
+        raise ValueError(f"x_ctrl_hist must be rank-5, got {tuple(x_ctrl_hist.shape)}")
+    if ctrl_seq.ndim != 5:
+        raise ValueError(f"ctrl_seq must be rank-5, got {tuple(ctrl_seq.shape)}")
+    if x_state_hist.shape[:2] != x_ctrl_hist.shape[:2]:
+        raise ValueError(
+            "x_state_hist and x_ctrl_hist batch/time dims must match: "
+            f"{tuple(x_state_hist.shape)} vs {tuple(x_ctrl_hist.shape)}"
+        )
+    if ctrl_seq.shape[1] < steps:
+        raise ValueError(
+            f"ctrl_seq has {ctrl_seq.shape[1]} steps but rollout requested {steps}"
+        )
+
+    t_hist = x_state_hist.shape[1]
+    history_eff = t_hist if history is None else int(history)
+    if history_eff < 1 or history_eff > t_hist:
+        raise ValueError(f"history must be in [1, {t_hist}], got {history_eff}")
+
+    max_warmup = history_eff - 1
+    warmup_steps_eff = max_warmup if warmup_steps is None else int(warmup_steps)
+    if warmup_steps_eff < 0 or warmup_steps_eff > max_warmup:
+        raise ValueError(
+            f"warmup_steps must be in [0, {max_warmup}] for history={history_eff}, got {warmup_steps_eff}"
+        )
+
+    history_start = t_hist - history_eff
+    hidden_states = None
+
+    for t in range(history_start, history_start + warmup_steps_eff):
+        u_t_hist = x_state_hist[:, t]  # (B, 1, T_inner, nx)
+        ctrl_t_hist = x_ctrl_hist[:, t]  # (B, 1, T_inner, n_ctrl)
+        _, hidden_states = ar_model_obj.forward_one(
+            u_t_hist,
+            ctrl_t_hist,
+            hidden_states=hidden_states,
+            return_hidden_states=True,
+        )
+
+    current_state = u0
+    traj = [current_state]
+    for k in range(steps):
+        ctrl_t = ctrl_seq[:, k]  # (B, 1, T_inner, n_ctrl)
+        u_next, hidden_states = ar_model_obj.forward_one(
+            current_state,
+            ctrl_t,
+            hidden_states=hidden_states,
+            return_hidden_states=True,
+        )
+        traj.append(u_next)
+        current_state = u_next
+
+    return torch.stack(traj, dim=1), warmup_steps_eff, hidden_states
+
+
+def evaluate_endpoint_metrics_variants(
+    ar_model_obj,
+    eval_loaders_by_h,
+    eval_steps,
+    device,
+    h_train: int | None = None,
+    history: int | None = None,
+    warmup_steps: int | None = None,
+    variants=("A", "B", "C"),
+):
+    """Evaluate endpoint Relative L2 for rollout variants A/B/C by horizon.
+
+    Each loader batch is expected to yield:
+    ``(x_state_hist, x_ctrl_hist, x_ctrl_seq, y_endpoint)`` with shapes
+    ``(B, T_hist, 1, T_inner, nx)``, ``(B, T_hist, 1, T_inner, n_ctrl)``,
+    ``(B, h, 1, T_inner, n_ctrl)``, ``(B, 1, T_inner, nx)``.
+    """
+    eval_steps = [int(h) for h in eval_steps]
+    variants = tuple(str(v).upper() for v in variants)
+    allowed = {"A", "B", "C"}
+    if any(v not in allowed for v in variants):
+        raise ValueError(f"variants must be subset of {allowed}, got {variants}")
+    if len(eval_steps) == 0:
+        raise ValueError("eval_steps must be non-empty")
+
+    if h_train is not None and max(eval_steps) > int(h_train):
+        print(
+            f"Warning: Evaluating beyond trained horizon (H_train={h_train}). Errors may be unstable and not comparable."
+        )
+
+    was_training = (
+        bool(ar_model_obj.training) if hasattr(ar_model_obj, "training") else False
+    )
+    if hasattr(ar_model_obj, "eval"):
+        ar_model_obj.eval()
+
+    results = {}
+    printed_shapes = False
+
+    with torch.no_grad():
+        for h in eval_steps:
+            if h not in eval_loaders_by_h:
+                raise ValueError(f"No evaluation loader for horizon h={h}")
+
+            loader = eval_loaders_by_h[h]
+            per_variant_sum = {v: 0.0 for v in variants}
+            n_total = 0
+
+            for x_state_hist, x_ctrl_hist, x_ctrl_seq, y_endpoint in loader:
+                x_state_hist = x_state_hist.to(
+                    device
+                ).float()  # (B, T_hist, 1, T_inner, nx)
+                x_ctrl_hist = x_ctrl_hist.to(
+                    device
+                ).float()  # (B, T_hist, 1, T_inner, n_ctrl)
+                x_ctrl_seq = x_ctrl_seq.to(device).float()  # (B, h, 1, T_inner, n_ctrl)
+                y_endpoint = y_endpoint.to(device).float()  # (B, 1, T_inner, nx)
+
+                if x_ctrl_seq.shape[1] < h:
+                    raise ValueError(
+                        f"Requested h={h}, but ctrl_seq has only {x_ctrl_seq.shape[1]} control steps"
+                    )
+
+                u0 = x_state_hist[:, -1]  # (B, 1, T_inner, nx)
+                ctrl_seq_h = x_ctrl_seq[:, :h]  # (B, h, 1, T_inner, n_ctrl)
+
+                if "A" in variants:
+                    pred_roll_a, _ = rollout_variant_a_carry(
+                        ar_model_obj=ar_model_obj,
+                        u0=u0,
+                        ctrl_seq=ctrl_seq_h,
+                        steps=h,
+                    )
+                    y_pred_a = pred_roll_a[:, -1]  # (B, 1, T_inner, nx)
+                    diff_a = (y_pred_a - y_endpoint).reshape(y_endpoint.shape[0], -1)
+                    y_flat = y_endpoint.reshape(y_endpoint.shape[0], -1)
+                    rel_a = torch.linalg.norm(diff_a, dim=1) / (
+                        torch.linalg.norm(y_flat, dim=1) + 1e-12
+                    )
+                    per_variant_sum["A"] += rel_a.sum().item()
+
+                if "B" in variants:
+                    pred_roll_b = rollout_variant_b_reset_each_step(
+                        ar_model_obj=ar_model_obj,
+                        u0=u0,
+                        ctrl_seq=ctrl_seq_h,
+                        steps=h,
+                    )
+                    y_pred_b = pred_roll_b[:, -1]  # (B, 1, T_inner, nx)
+                    diff_b = (y_pred_b - y_endpoint).reshape(y_endpoint.shape[0], -1)
+                    y_flat = y_endpoint.reshape(y_endpoint.shape[0], -1)
+                    rel_b = torch.linalg.norm(diff_b, dim=1) / (
+                        torch.linalg.norm(y_flat, dim=1) + 1e-12
+                    )
+                    per_variant_sum["B"] += rel_b.sum().item()
+
+                if "C" in variants:
+                    pred_roll_c, warmup_steps_eff, _ = (
+                        rollout_variant_c_warmup_then_carry(
+                            ar_model_obj=ar_model_obj,
+                            x_state_hist=x_state_hist,
+                            x_ctrl_hist=x_ctrl_hist,
+                            u0=u0,
+                            ctrl_seq=ctrl_seq_h,
+                            steps=h,
+                            history=history,
+                            warmup_steps=warmup_steps,
+                        )
+                    )
+                    y_pred_c = pred_roll_c[:, -1]  # (B, 1, T_inner, nx)
+                    diff_c = (y_pred_c - y_endpoint).reshape(y_endpoint.shape[0], -1)
+                    y_flat = y_endpoint.reshape(y_endpoint.shape[0], -1)
+                    rel_c = torch.linalg.norm(diff_c, dim=1) / (
+                        torch.linalg.norm(y_flat, dim=1) + 1e-12
+                    )
+                    per_variant_sum["C"] += rel_c.sum().item()
+
+                if not printed_shapes:
+                    print("x_state_hist:", tuple(x_state_hist.shape))
+                    print("x_ctrl_hist:", tuple(x_ctrl_hist.shape))
+                    print("ctrl_seq used:", tuple(ctrl_seq_h.shape))
+                    print("y_true endpoint:", tuple(y_endpoint.shape))
+                    if "A" in variants:
+                        print("y_pred A endpoint:", tuple(y_pred_a.shape))
+                    if "B" in variants:
+                        print("y_pred B endpoint:", tuple(y_pred_b.shape))
+                    if "C" in variants:
+                        print("y_pred C endpoint:", tuple(y_pred_c.shape))
+                        print("warmup_steps used (C):", int(warmup_steps_eff))
+                    printed_shapes = True
+
+                n_total += x_state_hist.shape[0]
+
+            results[h] = {"N": int(n_total)}
+            for v in variants:
+                results[h][v] = per_variant_sum[v] / max(n_total, 1)
+
+    if hasattr(ar_model_obj, "train") and was_training:
+        ar_model_obj.train()
+
+    header = "Steps  N    " + "  ".join([f"RelL2-{v}" for v in variants])
+    print("Endpoint Rel. L2 by horizon and variant")
+    print("-" * len(header))
+    print(header)
+    for h in eval_steps:
+        vals = "  ".join([f"{results[h][v]:.6e}" for v in variants])
+        print(f"{h:<5d}  {results[h]['N']:<4d} {vals}")
+
+    return results
